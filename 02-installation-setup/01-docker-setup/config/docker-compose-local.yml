@@ -1,0 +1,32 @@
+# ============================================================
+# Docker Compose - MINIMAL Local Development Setup
+# ============================================================
+# A stripped-down version for fast local development.
+# Uses SequentialExecutor + SQLite (no PostgreSQL needed).
+#
+# TRADE-OFFS:
+#   ✓ Starts in seconds (single container)
+#   ✓ No external dependencies
+#   ✗ Only 1 task at a time (sequential)
+#   ✗ SQLite doesn't support concurrent writes
+#   ✗ NOT suitable for testing production workflows
+#
+# Usage:
+#   docker compose -f docker-compose-local.yml up
+# ============================================================
+
+services:
+  airflow-standalone:
+    image: apache/airflow:2.10.4-python3.11
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__WEBSERVER__SECRET_KEY: 'local-dev-only-secret'
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+      - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+    ports:
+      - "8080:8080"
+    command: standalone
+    # 'standalone' mode runs webserver + scheduler in one process
+    # and auto-creates an admin user (printed in logs)

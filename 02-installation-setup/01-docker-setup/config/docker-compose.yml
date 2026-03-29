@@ -1,0 +1,197 @@
+# ============================================================
+# Apache Airflow Docker Compose - Development Setup
+# ============================================================
+# Based on the official Apache Airflow docker-compose.yaml
+# Optimized for local development with LocalExecutor
+#
+# Services:
+#   - airflow-webserver (UI at localhost:8080)
+#   - airflow-scheduler (DAG parser + task scheduler)
+#   - airflow-triggerer  (async deferrable operators)
+#   - airflow-init       (one-time DB initialization)
+#   - postgres           (metadata database)
+#
+# Usage:
+#   docker compose up airflow-init   # First time only
+#   docker compose up -d             # Start all services
+#   docker compose down              # Stop all services
+#   docker compose down -v           # Stop + remove volumes
+# ============================================================
+
+x-airflow-common:
+  &airflow-common
+  # Use the official Airflow image. Pin to a specific version for stability.
+  image: apache/airflow:2.10.4-python3.11
+  # Uncomment to use a custom Dockerfile (adds your Python packages):
+  # build:
+  #   context: .
+  #   dockerfile: Dockerfile
+  environment:
+    &airflow-common-env
+    # Database connection (shared PostgreSQL)
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+
+    # Executor: LocalExecutor is good for development and small production
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+
+    # Fernet key for connection encryption (generate a new one for production!)
+    AIRFLOW__CORE__FERNET_KEY: ''
+
+    # Don't load example DAGs (they clutter the UI)
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+
+    # Modern API auth backend
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+
+    # Scheduling performance
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: '30'
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: '30'
+
+    # Logging
+    AIRFLOW__LOGGING__LOGGING_LEVEL: 'INFO'
+
+    # Python path for custom modules
+    PYTHONPATH: '/opt/airflow/dags:/opt/airflow/plugins'
+
+    # Pip packages to install at startup (lightweight alternative to custom Dockerfile)
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+
+  volumes:
+    # Mount your local directories into the container
+    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags       # Your DAG files
+    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs       # Task logs
+    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins  # Custom plugins
+    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config    # Config files
+
+  user: "${AIRFLOW_UID:-50000}:0"
+
+  depends_on:
+    &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  # ──────────────────────────────────────────────
+  # PostgreSQL - Metadata Database
+  # ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+    ports:
+      - "5432:5432"  # Expose for debugging (remove in production)
+
+  # ──────────────────────────────────────────────
+  # Airflow Webserver - UI at http://localhost:8080
+  # ──────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ──────────────────────────────────────────────
+  # Airflow Scheduler - Parses DAGs, creates runs
+  # ──────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck:
+      test: ["CMD", "airflow", "jobs", "check", "--job-type", "SchedulerJob", "--hostname", "$${HOSTNAME}"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ──────────────────────────────────────────────
+  # Airflow Triggerer - Deferrable task support
+  # ──────────────────────────────────────────────
+  airflow-triggerer:
+    <<: *airflow-common
+    command: triggerer
+    healthcheck:
+      test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ──────────────────────────────────────────────
+  # Airflow Init - One-time database setup
+  # ──────────────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        # Check UID is set correctly
+        if [[ -z "${AIRFLOW_UID}" ]]; then
+          echo "WARNING: AIRFLOW_UID not set. Using default (50000)."
+        fi
+        # Initialize the database and create admin user
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com || true
+        echo "Initialization complete!"
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-admin}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-admin}
+    user: "0:0"
+
+  # ──────────────────────────────────────────────
+  # Airflow CLI - Run ad-hoc Airflow commands
+  # ──────────────────────────────────────────────
+  airflow-cli:
+    <<: *airflow-common
+    profiles:
+      - debug
+    environment:
+      <<: *airflow-common-env
+      CONNECTION_CHECK_MAX_COUNT: "0"
+    command:
+      - bash
+      - -c
+      - airflow
+
+volumes:
+  postgres-db-volume:
