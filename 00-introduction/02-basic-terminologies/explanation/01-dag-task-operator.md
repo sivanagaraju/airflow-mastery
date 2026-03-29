@@ -4,6 +4,16 @@
 
 ---
 
+## What These Terms Mean and Why They're Designed This Way
+
+Every Airflow pipeline is built from three nested abstractions: the DAG, the Task, and the Operator. Understanding not just what they are but *why* they're separated this way is the foundation of writing maintainable pipelines. Engineers who don't internalise this distinction write brittle pipelines with mismatched responsibilities, untestable task logic, and poor retry behaviour.
+
+Think of building a **hospital's surgical schedule**. The schedule itself is like the DAG — it defines what procedures happen, in what order, on what days. Each line-item on the schedule ("Patient A: knee replacement, 9 AM, OR-3") is like a Task — a specific unit of work with a specific context. The surgical technique being used ("laparoscopic, minimally invasive") is like the Operator — the *how*. You can use the same surgical technique (Operator) for different patients on different days (Task Instances), and the schedule (DAG) coordinates all of them. The separation matters: if you conflate the schedule with the procedure, you can't reuse techniques, and you can't reschedule without rewriting everything.
+
+This three-level hierarchy is Airflow's most important design decision. It enables: reusable operators across teams, testable task logic independent of scheduling, and the ability to backfill (rerun specific Task Instances) without touching the DAG definition.
+
+---
+
 ## The Hierarchy
 
 ```
@@ -173,17 +183,134 @@ graph TB
 
 ---
 
+## Real Company Use Cases
+
+**WePay — Custom Operators as Organisational Standards**
+
+WePay (acquired by Chase) built a library of custom operators that wraps their internal services: `WepaySnowflakeOperator`, `WepayDbtOperator`, and `WepayAlertOperator`. Every pipeline in the organisation must use these standardised operators rather than raw provider operators. The `WepaySnowflakeOperator` adds company-mandated behaviour on top of the standard Snowflake operator: it logs every query to an audit table, enforces query timeouts via Snowflake session parameters, and automatically routes to the correct Snowflake warehouse based on the task's `pool` assignment. This means every engineer gets security compliance and cost management for free — they just use the operator. The architecture works because Airflow's Operator abstraction is a clean extension point: you subclass `BaseOperator`, override `execute()`, and every future pipeline inherits the new behaviour automatically.
+
+**Etsy — Task Instance Data as Business Intelligence**
+
+Etsy's data platform team queryies the `task_instance` table directly in their internal analytics system. They built a BI dashboard that shows: which tasks run the longest, which tasks fail most frequently, and which DAG owners have the worst SLA track record — all based on `task_instance.duration`, `task_instance.state`, and `task_instance.dag_id`. This is possible because every execution of every Task creates a Task Instance record in the metadata DB. The Task / Task Instance distinction is not just conceptual — it's a Postgres table, queryable like any other data source. Etsy's dashboard runs from a query like `SELECT task_id, avg(duration) FROM task_instance WHERE state='success' GROUP BY task_id ORDER BY avg(duration) DESC`.
+
+---
+
+## Anti-Patterns and Common Mistakes
+
+**1. Using PythonOperator instead of the TaskFlow API for all new code**
+
+The traditional `PythonOperator` requires you to pass `python_callable=my_function` and manually handle XCom pushes/pulls. The `@task` decorator (TaskFlow API, Airflow 2.0+) eliminates all of this boilerplate and makes data flow between tasks explicit through return values.
+
+```python
+# ✗ OLD STYLE — verbose, manual XCom, harder to read
+from airflow.operators.python import PythonOperator
+
+def extract_fn(**context):
+    data = {"rows": 1000}
+    context["task_instance"].xcom_push(key="extracted", value=data)
+    return data
+
+def load_fn(**context):
+    data = context["task_instance"].xcom_pull(task_ids="extract", key="extracted")
+    print(f"Loading: {data}")
+
+extract_task = PythonOperator(task_id="extract", python_callable=extract_fn)
+load_task = PythonOperator(task_id="load", python_callable=load_fn)
+extract_task >> load_task
+
+# ✓ TASKFLOW API — clean, return values automatically become XComs
+from airflow.decorators import dag, task
+
+@dag(schedule="@daily", start_date=pendulum.datetime(2024, 1, 1))
+def my_pipeline():
+    @task()
+    def extract() -> dict:
+        return {"rows": 1000}  # auto-pushed to XCom
+
+    @task()
+    def load(data: dict):  # data auto-pulled from XCom
+        print(f"Loading: {data}")
+
+    load(extract())  # dependency is explicit from function call
+
+my_pipeline()
+```
+
+**2. Putting business logic in the DAG file outside task functions**
+
+Code written at the DAG file's module level runs every time the scheduler parses the file (every 30 seconds). Database queries, API calls, and business logic at module level execute thousands of times per day for zero benefit, adding parse-time latency and potential failures.
+
+```python
+# ✗ WRONG — business logic executes on every scheduler parse
+from mylib.config import get_active_regions  # if this fails, DAG disappears from UI
+ACTIVE_REGIONS = get_active_regions(db_conn)  # DB query every 30 seconds!
+
+@dag(...)
+def my_dag():
+    for region in ACTIVE_REGIONS:  # stale list baked in at parse time
+        process_region(region)
+
+# ✓ CORRECT — dynamic values fetched at task execution time
+@dag(...)
+def my_dag():
+    @task()
+    def get_regions() -> list:
+        from mylib.config import get_active_regions  # import inside task
+        return get_active_regions(db_conn)  # runs once, when task executes
+
+    @task()
+    def process_region(region: str):
+        print(f"Processing {region}")
+
+    process_region.expand(region=get_regions())  # dynamic task mapping
+```
+
+**3. Creating a Sensor to wait for tasks in the same DAG**
+
+Engineers sometimes use `ExternalTaskSensor` to wait for another task in the same DAG to complete. This is unnecessary — Airflow's dependency resolution (`>>` operator) already handles intra-DAG dependencies. Using a sensor adds a polling worker slot, adds latency, and creates circular dependency risk.
+
+```python
+# ✗ WRONG — sensor waiting for task in same DAG
+extract = PythonOperator(task_id="extract", ...)
+wait_for_extract = ExternalTaskSensor(
+    task_id="wait_for_extract",
+    external_dag_id="my_dag",  # same DAG!
+    external_task_id="extract",  # burns a slot polling for a task already in this DAG
+)
+load = PythonOperator(task_id="load", ...)
+wait_for_extract >> load  # incorrect workaround
+
+# ✓ CORRECT — use >> to express intra-DAG dependencies directly
+extract >> load  # Airflow handles this natively
+```
+
+---
+
 ## Interview Q&A
+
+### Senior Data Engineer Level
 
 **Q: What's the difference between a Task and a Task Instance?**
 
-> A Task is the **definition** — it exists in the DAG file and defines *what* work to do (which operator, which parameters). A Task Instance is a **specific execution** of that task for a particular DAG Run (tied to a logical date). One Task creates many Task Instances over time — one per scheduled run. When you "clear" a task in the UI, you're resetting a specific Task Instance, not the Task definition.
+A Task is the definition — it exists in the DAG file and defines *what* work to do (which operator, which parameters, which dependencies). A Task Instance is a specific execution of that task for a particular DAG Run, tied to a `logical_date`. One Task creates many Task Instances over time: one per scheduled DAG Run per schedule interval. When you "clear" a task in the UI, you're resetting specific Task Instances (their state goes back to `None`), not the Task definition. The Task definition changes only when you edit the DAG Python file.
 
-**Q: Why does Airflow distinguish between "logical date" (execution_date) and actual execution time?**
+**Q: Why does Airflow distinguish between `logical_date` (execution_date) and the actual execution wall-clock time?**
 
-> Because Airflow is designed for **batch processing of time-partitioned data**. If a DAG runs daily and processes "yesterday's data," the logical date represents *which day's data* is being processed, not *when the processing happened*. A DAG scheduled for midnight processes the *previous day's* data. This decoupling also enables backfill — you can create a DAG Run for any historical date and reprocess that date's data.
+Because Airflow is designed for batch processing of time-partitioned data. If a daily DAG processes "yesterday's sales data," the `logical_date` represents *which day's data* is being processed, not *when the processing ran*. A DAG scheduled for midnight represents the previous day's interval. This decoupling enables backfill: you can create a DAG Run with any historical `logical_date` and reprocess that date's data using the same task code. Without this distinction, backfill would require special-casing the date logic inside every task.
 
----
+**Q: You have a custom Snowflake query that all 50 of your teams' DAGs need to run before their main ETL. How do you avoid copy/pasting this across 50 DAG files?**
+
+Two approaches depending on complexity. If the query is simple: create a shared utility function in a module under `dags/shared/` and import it in each team's DAG file — they call it inside a `@task`. If the pattern is complex and needs its own retry logic, connection handling, and alert configuration: create a custom operator by subclassing `BaseOperator` and publishing it as a shared Python package (`my_company_airflow_operators`). All DAGs `pip install` this package and use `MySnowflakeAuditOperator`. The custom operator approach is preferable at scale because it centralises the implementation — if the Snowflake connection changes, you update one file and redeploy, not 50 DAG files.
+
+### Lead / Principal Data Engineer Level
+
+**Q: You're designing a company-wide DAG standards framework. What conventions do you establish for DAG ID naming, task ID naming, tag taxonomy, and default_args?**
+
+DAG ID convention: `{team}_{domain}_{pipeline}_{frequency}` — e.g., `payments_transactions_settlement_daily`. This makes ownership and scope immediately readable. Task ID convention: `{verb}_{subject}_{destination}` — e.g., `extract_transactions_postgres`, `load_settlement_snowflake`. Tags taxonomy: mandatory `team:{team}`, `tier:{1|2|3}`, `domain:{domain}`, optional `upstream:{source_system}`. This enables RBAC, on-call alerting, and cost attribution. default_args convention: establish a company-wide `DEFAULT_ARGS` dict in a shared module — it sets `owner` from a team registry lookup, `retries=3`, `retry_delay=5min`, `email_on_failure=True` with team distribution list. All DAGs import this and override only what they need. This guarantees that every pipeline has retry logic and alerting by default, not as an afterthought.
+
+**Q: A data engineer asks: "When should I use a custom Operator vs a PythonOperator calling a function?" What's your principled answer?**
+
+Use a custom Operator when: (1) the behaviour is reused across three or more DAGs — at that point, the packaging overhead pays off, (2) the Operator needs to manage a connection lifecycle (open, use, close) that should be centralised, (3) the Operator has configuration that should be validated at DAG parse time, not at task runtime — custom Operators can raise in `__init__` if misconfigured, giving parse-time feedback instead of a runtime failure. Use a `@task`-decorated function when: (1) the logic is specific to one pipeline, (2) the function is already tested in isolation as a pure Python function, (3) you want the simplest possible construction. The rule of thumb: if you're about to copy a PythonOperator's callable from one DAG file to another, that's the signal to wrap it in a custom Operator instead.
 
 ## Self-Assessment Quiz
 
@@ -196,6 +323,16 @@ graph TB
 <details><summary>Answer</summary>An Operator is a **class** (a template for work — e.g., PythonOperator, BashOperator). A Task is an **instance** of an Operator configured with specific parameters (task_id, callable, etc.). You cannot have a useful Operator without wrapping it in a Task — the Operator class alone has no task_id, no DAG association, and can't be scheduled. It's like having a recipe template vs actually deciding to cook something specific with it.</details>
 
 ### Quick Self-Rating
-- [ ] I can distinguish DAG, DAG Run, Task, Task Instance, and Operator
-- [ ] I can explain why logical date differs from actual execution time
-- [ ] I can categorize any operator into action/transfer/sensor
+- [ ] I can distinguish DAG, DAG Run, Task, Task Instance, and Operator from memory
+- [ ] I can explain why `logical_date` differs from actual execution time with a concrete example
+- [ ] I can categorise any operator into action/transfer/sensor and explain the difference
+- [ ] I can write a complete DAG using the TaskFlow API with proper dependency expression
+
+---
+
+## Further Reading
+
+- [Airflow Docs — TaskFlow API Tutorial](https://airflow.apache.org/docs/apache-airflow/stable/tutorial/taskflow.html)
+- [Airflow Docs — DAG Concepts](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html)
+- [Airflow Docs — Custom Operators](https://airflow.apache.org/docs/apache-airflow/stable/howto/custom-operator.html)
+- [Airflow Docs — Dynamic Task Mapping](https://airflow.apache.org/docs/apache-airflow/stable/authoring-and-scheduling/dynamic-task-mapping.html)

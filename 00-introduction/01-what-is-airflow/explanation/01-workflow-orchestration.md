@@ -141,29 +141,94 @@ graph TB
 
 ---
 
-## Anti-Patterns & Common Mistakes
+## Real Company Use Cases
 
-| Mistake | Why It's Wrong | Correct Approach |
-|---------|---------------|-----------------|
-| Using Airflow to process large datasets directly | Airflow workers have limited memory; tasks should be lightweight triggers | Use Airflow to trigger Spark/BigQuery, not replace them |
-| Creating one massive DAG with 500 tasks | Hard to debug, slow to parse, blocks scheduling | Split into multiple DAGs with `TriggerDagRunOperator` |
-| Treating Airflow as a real-time system | Minimum schedule interval is ~1 second; designed for batch | Use Kafka/Flink for streaming, Airflow for batch orchestration |
+**Airbnb — Orchestrating 10,000+ DAGs at Scale**
+
+Airbnb is where Airflow was born (open-sourced in 2015). Their core problem was exactly the cron-fragility described above — hundreds of independent scripts with time-based dependencies. After building Airflow, they consolidated these into DAGs with real dependency management. By 2020, Airbnb was running over 10,000 DAGs and 1.2 million task instances per day. The key architectural decision that made this scale: Airflow as a pure orchestrator. Every heavy computation — Hive queries, Spark jobs, ML training — runs on dedicated clusters. Airflow tasks are lightweight trigger-and-monitor operations, never data processors themselves.
+
+**Uber — Real-Time ETL to Batch Boundary**
+
+Uber's data engineering team uses Airflow to orchestrate the boundary between their real-time streaming layer (Kafka/Flink) and their batch analytics layer (Hive/Presto). Every hour, Airflow DAGs trigger Hive queries that compact Kafka-landed Parquet files, compute aggregates, and load them into Uber's data warehouse. The critical orchestration requirement: a task cannot start until the previous hour's streaming data has fully landed in S3. Airflow's sensor-based triggering (wait for a `_SUCCESS` file) provides exactly this coordination — something cron cannot do without complex workarounds.
+
+---
+
+## Anti-Patterns and Common Mistakes
+
+**1. Processing data inside Airflow tasks ("Fat PythonOperator")**
+
+Engineers new to Airflow write code like this:
+
+```python
+@task()
+def process_all_sales():
+    import pandas as pd
+    df = pd.read_csv("s3://bucket/sales.csv")  # 50GB file!
+    df = df.groupby("region").agg({"revenue": "sum"})
+    df.to_parquet("s3://bucket/output.parquet")
+```
+
+This fails in production because Airflow worker containers typically have 2-4GB RAM. A 50GB CSV will OOMKill the worker, which then appears as a mysterious task failure with no useful error message. **Fix:** Submit the processing to a dedicated compute system and let Airflow monitor it:
+
+```python
+@task()
+def trigger_spark_job():
+    # Trigger a Spark job via the EMR operator — Airflow monitors, Spark processes
+    from airflow.providers.amazon.aws.operators.emr import EmrAddStepsOperator
+    # ... submission code; Airflow waits for completion, not processes data
+```
+
+**2. One monolithic DAG with 300+ tasks**
+
+A common early mistake is combining all pipeline steps into a single DAG. At 300 tasks per run, the scheduler spends significant time evaluating dependencies on every heartbeat. The DAG parse time increases because one Python file does thousands of operator instantiations. A single bug anywhere fails the entire pipeline.
+
+**Fix:** Split into composable DAGs by domain or layer:
+
+```python
+# Instead of one 300-task DAG, create domain-specific ones:
+# extract_dag.py  — 20 extract tasks
+# transform_dag.py — 40 transform tasks, triggered when extract completes
+# load_dag.py — 10 load tasks, triggered by transform
+# notify_dag.py — triggered by load
+```
+
+**3. Using Airflow for real-time/streaming workloads**
+
+Engineers sometimes schedule DAGs at `schedule="* * * * *"` (every minute) thinking this creates near-real-time processing. Airflow's minimum scheduling overhead is 5-30 seconds per DAG Run creation, plus queue time. At sub-minute frequency, the scheduler becomes the bottleneck and starts missing runs.
+
+**Fix:** For sub-minute latency, use Kafka + Flink. Use Airflow for the hourly/daily batch jobs that read from the stream's output.
 
 ---
 
 ## Interview Q&A
 
+### Senior Data Engineer Level
+
 **Q: What is the difference between a workflow engine and a workflow orchestrator?**
 
-> A workflow **engine** (like Apache NiFi or Spark) actually processes data — it moves bytes, transforms records, runs computations. A workflow **orchestrator** (like Airflow) *coordinates* when and in what order those engines run. Airflow doesn't process your data; it tells your data processors when to start, watches for completion, retries on failure, and provides a UI to monitor everything. This separation of concerns is architecturally critical because it means Airflow stays lightweight while your heavy processing runs on dedicated infrastructure (EMR, Databricks, BigQuery).
+A workflow **engine** (like Apache NiFi or Spark) actually processes data — it moves bytes, transforms records, runs computations. A workflow **orchestrator** (like Airflow) *coordinates* when and in what order those engines run. Airflow doesn't process your data; it tells your data processors when to start, watches for completion, retries on failure, and provides a UI to monitor everything. This separation of concerns is architecturally critical — it means Airflow stays lightweight while your heavy processing runs on dedicated infrastructure (EMR, Databricks, BigQuery). Mixing the two roles is the #1 beginner mistake.
 
-**Q: Why can't you have cycles in a DAG?**
+**Q: Why can't you have cycles in a DAG, and what happens if you accidentally create one?**
 
-> A cycle creates infinite recursion — if Task A depends on Task B, and Task B depends on Task A, neither can ever start. Airflow validates the graph at DAG parse time and raises `AirflowDagCycleException` if cycles are detected. This constraint is a feature, not a limitation: it forces engineers to design clean, deterministic pipelines.
+A cycle creates infinite recursion — if Task A depends on Task B, and Task B depends on Task A, neither can ever start because each is waiting for the other. Airflow detects this at DAG parse time by running a topological sort algorithm on the graph. When a cycle is found, it raises `AirflowDagCycleException` and refuses to load the DAG. The file still appears in the scheduler's error log. This constraint is a feature: it forces deterministic pipeline design. The most common way to accidentally create a cycle is with complex fan-in patterns — always visualise your DAG with `airflow dags show <dag_id>` before deploying.
 
-**Q: A junior engineer proposes deploying 10 separate cron jobs instead of using Airflow. What's your response?**
+**Q: A junior engineer proposes deploying 10 separate cron jobs instead of using Airflow. Walk me through your response.**
 
-> Three problems with cron: (1) No dependency management — you'd hardcode time gaps and pray step N finishes before step N+1 starts, (2) No visibility — when a cron job fails at 3 AM, you won't know until someone checks logs manually, (3) No retry logic — if the database is temporarily unreachable, cron doesn't retry. Airflow solves all three: it runs step N+1 only after N succeeds, provides a UI showing real-time status, and has built-in retry with exponential backoff. The operational overhead of cron at scale is far higher than Airflow's initial setup cost.
+Three concrete problems with cron at the stated scale: First, no dependency management — you'd have to hardcode time gaps between jobs ("hope job 1 finishes in 30 minutes before job 2 starts"), which breaks the moment one job runs slow. Second, no operational visibility — when a cron job fails at 3 AM, nobody knows until someone manually checks logs hours later. Third, no retry logic — if the database is temporarily unreachable, cron doesn't retry. Airflow solves all three with dependency declarations, a real-time UI, and configurable retry policies. The operational overtime cost of debugging cron failures at scale far exceeds Airflow's setup cost.
+
+### Lead / Principal Data Engineer Level
+
+**Q: Your organisation runs 500 DAGs on Airflow. The scheduler is becoming a bottleneck — DAG Runs are created late, tasks queue for minutes before starting. Walk me through your diagnostic and remediation approach.**
+
+I'd start by measuring, not guessing. The scheduler has specific knobs: first, I'd check `min_file_process_interval` — if it's too low (say, 5 seconds), the scheduler spends all its time parsing files and has no capacity left for scheduling tasks. Set it to 30-60 seconds for large installations. Second, increase `parsing_processes` to match CPU cores minus 1. Third, look for "fat" DAG files with top-level expensive imports or dynamic generation — each one adds parse latency that multiplies across 500 files. Fourth, consider High Availability mode (2+ Scheduler instances) to distribute the parsing load. Finally, if the DB is the bottleneck (scheduler queries), add a read replica and point the scheduler there. I'd monitor `airflow dags report` continuously to track parse times per file and identify the worst offenders.
+
+**Q: A VP of Engineering asks: "Should we use Airflow for our new real-time ML feature store pipeline that needs sub-second updates?" How do you advise?**
+
+No — and I'd explain exactly why. Airflow's scheduling model is batch-first: the minimum practical scheduling interval is around 1 minute (cron precision) and the actual task start overhead (scheduler detection → executor dispatch → worker pickup) adds 5-30 seconds. For a sub-second SLA, Airflow is the wrong layer entirely. The right architecture separates concerns: use Kafka + Flink/Spark Streaming for the real-time feature computation (sub-second), and then use Airflow for the batch maintenance jobs around that system — daily retraining, weekly quality checks, monthly data exports. Airflow and streaming systems are complementary, not competing.
+
+**Q: You're inheriting a codebase where every DAG has 15+ imports at the module level including pandas, sklearn, and custom ML libraries. What's the business impact and how do you fix it at scale?**
+
+The business impact is scheduler degradation: every import runs on every parse cycle (every 30 seconds by default). With 50 DAGs each importing sklearn (200ms import time), the scheduler spends 50 × 0.2s = 10 seconds per cycle just on imports, leaving less time for actual scheduling. This causes DAG Runs to be created late, task queue depth grows, and pipelines miss their SLAs. The fix requires establishing an engineering standard: all heavy imports must live inside task-level functions, not at module level. I'd implement this by adding a custom pre-commit hook that scans for top-level imports exceeding a threshold (using `importtime`), failing the PR with an explanation. For the existing codebase, I'd run `airflow dags report` to baseline parse times, then fix the slowest files first using a refactoring script.
 
 ---
 
@@ -198,6 +263,7 @@ graph TB
 
 ## Further Reading
 
-- [Apache Airflow Documentation — Concepts](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html)
-- [Airflow Summit 2023 — Keynote: Airflow at Scale](https://airflowsummit.org/)
-- [Martin Kleppmann — Designing Data-Intensive Applications, Ch. 10](https://dataintensive.net/) (batch processing foundations)
+- [Apache Airflow Docs — Core Concepts: DAGs](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html)
+- [Maxime Beauchemin — Airflow: a workflow management platform (original blog post)](https://medium.com/airbnb-engineering/airflow-a-workflow-management-platform-46318b977fd8)
+- [Airflow Summit Talks — Architecture at Scale](https://airflowsummit.org/)
+- [Martin Kleppmann — Designing Data-Intensive Applications, Ch. 10](https://dataintensive.net/)
